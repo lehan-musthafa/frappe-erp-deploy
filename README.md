@@ -1,52 +1,140 @@
-# Frappe CRM deployment
+# Frappe ERP on Coolify (ERPNext + HR + CRM)
 
-Generated 2026-11-14 by running the compose-generation step of
-`frappe/bench` `easy-install.py deploy` against `frappe_docker` main, with the
-flags from the Frappe CRM docs (`--image=ghcr.io/frappe/crm --version=stable --app=crm`).
+This repo runs one Frappe stack on Coolify with three apps:
 
-- `easy-install-exact.yml`: exactly what the script produces, including its own Traefik on ports 80/443.
-  The only change is that the secrets and site name are placeholders: `${DB_PASSWORD}`, `${SITE_NAME}`, `${LETSENCRYPT_EMAIL}`.
-- `coolify-compose.yml`: the same stack, minus Traefik and the published ports, for use behind Coolify's proxy.
-  The only `$` in it is `${SERVICE_PASSWORD_MARIADB}`, which Coolify generates automatically. Config values are written out literally, and `FRAPPE_SITE_NAME_HEADER` is left to the nginx entrypoint's default (`$host`).
-  It also uses newer images than the script: MariaDB 12.3 LTS instead of 11.8, Redis 8.10 instead of 8.6. Frappe does not officially test these versions.
+- **ERPNext**: accounting, invoicing, stock and buying/selling
+- **Frappe HR** (`hrms`): employees, leave, attendance, payroll
+- **Frappe CRM**: leads and deals, served at `/crm`
 
-## Image (read first)
+All three are installed on one site, so they share users and data. For example, a CRM deal can become an ERPNext customer and quotation.
+
+## Why the image is self-built
 
 The official `ghcr.io/frappe/crm` images have **not contained the crm app since v1.67.1**
-([frappe/crm#2538](https://github.com/frappe/crm/issues/2538)). `stable`, `v16.0.3` and `v1.92.0` all contain only Frappe.
-`v1.67.0` is the last good one.
+([frappe/crm#2538](https://github.com/frappe/crm/issues/2538)).
+`stable`, `v16.0.3` and `v1.92.0` all contain only Frappe, and `v1.67.0` is the last good one. CRM's build workflow
+still passes `APPS_JSON_BASE64`, but frappe_docker now reads apps from an `apps_json` build secret.
 
-Build your own image instead:
+`.github/workflows/build-image.yml` uses frappe_docker's documented layered build to produce
+`ghcr.io/lehan-musthafa/frappe-erp` with frappe, erpnext, hrms and crm. The workflow fails if any of those apps
+is missing from the image.
 
-1. Push this folder to a GitHub repo.
-2. Run **Actions → Build Frappe CRM image** (defaults: CRM `version-16` on Frappe `version-16`).
-   The workflow fails if `crm` is missing from the image.
-3. Make the `frappe-crm` package public, or add GHCR credentials in Coolify (Servers → Registries).
-4. In `coolify-compose.yml`, replace `YOUR_GITHUB_USER` with your lowercase GitHub user or org.
-   For reproducible deploys, pin the `version-16-<run number>` tag.
+## Files
 
-## Coolify
+- `coolify-compose.yml`: the stack to paste into Coolify.
+- `easy-install-exact.yml`: what `easy-install.py deploy` would generate. It's for reference only and uses the broken image.
+- `.github/workflows/build-image.yml`: the image build.
 
-1. Create a new **Docker Compose Empty** resource and paste in `coolify-compose.yml`.
-2. Nothing to set. Coolify generates `SERVICE_PASSWORD_MARIADB`, which you can see in the Environment Variables tab.
-3. Set the domain on the `frontend` service to `https://crm.yourdomain.com:8080`.
-4. Deploy, then create the site once from the `backend` container terminal.
-   This is the same command the script runs after `up`:
+`coolify-compose.yml` is the easy-install stack with these changes:
+- The script's Traefik and published ports are removed, because Coolify's proxy routes to `frontend:8080`.
+- The DB root password is Coolify's generated `${SERVICE_PASSWORD_MARIADB}`.
+- Config values are written out literally, because Coolify can't parse `$$VAR` escapes.
+- `FRAPPE_SITE_NAME_HEADER` is left to nginx's default, `$host`.
+- The images are newer than the script's: MariaDB 12.3 LTS instead of 11.8, and Redis 8.10 instead of 8.6.
+  Frappe doesn't officially test these versions. `--innodb-snapshot-isolation=OFF` is kept, because 12.3 defaults it to ON.
 
-   ```
-   bench new-site --mariadb-user-host-login-scope='%' --db-root-password=<SERVICE_PASSWORD_MARIADB value> \
-     --admin-password=<choose one> --install-app crm crm.yourdomain.com
-   ```
+---
 
-   The site name **must equal the domain**. nginx selects the site from the Host header
-   (`FRAPPE_SITE_NAME_HEADER: $host`).
-5. Open `https://crm.yourdomain.com/crm`.
+## Step-by-step
 
-## Upgrade (what `easy-install.py upgrade` does)
+### 1. Build the image (about 30–45 min)
 
-Rerun the build workflow, change the image tag, redeploy, then run `bench --site all migrate` in `backend`.
+1. Open **Actions → Build Frappe ERP image → Run workflow**. Keep the branch as `version-16` and run it.
+2. Wait for a green run. The **Verify all apps** step prints each app's version. The run summary shows the
+   exact tag, for example `ghcr.io/lehan-musthafa/frappe-erp:version-16-3`.
 
-## Backups
+### 2. Let Coolify pull the image
 
-The `cron` (ofelia) container runs `bench --site all backup` every 6 hours.
-Backups land in the `sites` volume at `sites/<site>/private/backups`. Copy them off the server.
+The package is private by default. Pick one of these:
+
+- **Make it public** (simplest). The image contains only open-source code and no secrets.
+  Go to github.com → your profile → **Packages → frappe-erp → Package settings → Change visibility → Public**.
+- **Keep it private.** Create a GitHub token (classic) with only `read:packages`. Then on the Coolify server, run
+  `docker login ghcr.io -u lehan-musthafa` and paste the token as the password.
+
+### 3. DNS
+
+Create an A record, for example `erp.tuteome.com`, pointing to the Coolify server.
+Use a general name, because this site holds the whole ERP and not just CRM. The site name can't easily be changed later.
+
+### 4. Clean up the earlier failed attempt
+
+In the existing Coolify resource, stop it, delete it, and also delete its volumes (`sites`, `db-data`,
+`redis-queue-data`). The failed `new-site` left a half-installed Frappe 15 site behind, and nothing in it is worth keeping.
+
+### 5. Create the Coolify resource
+
+1. Go to **+ New → Docker Compose Empty** and paste in `coolify-compose.yml`.
+2. Optionally change `image:` from `version-16` to the pinned `version-16-<run>` tag from step 1. A pinned tag means
+   redeploys never pull a new version by surprise. If you pin it, replace all 7 occurrences.
+3. In the **Environment Variables** tab, check that `SERVICE_PASSWORD_MARIADB` was generated. Copy it, because you need it in step 7.
+4. Set the domain on the `frontend` service only: `https://erp.tuteome.com:8080`.
+   The `:8080` is the container port. Coolify still serves the site on 443.
+5. Leave every other service without a domain.
+
+### 6. Deploy
+
+Click **Deploy**. Then check the following:
+- `configurator` runs once and exits with code 0. That's expected.
+- `db` reports healthy.
+- `backend`, `frontend`, `websocket`, `queue-short`, `queue-long`, `scheduler` and `cron` are running.
+
+At this point, opening the domain shows a "site not found" error. That's expected until step 7.
+
+### 7. Create the site (once)
+
+Open Coolify's **Terminal**, select the `backend` container, and run:
+
+```
+bench new-site erp.tuteome.com \
+  --mariadb-user-host-login-scope='%' \
+  --db-root-password='<SERVICE_PASSWORD_MARIADB>' \
+  --admin-password='<choose a strong one>' \
+  --install-app erpnext --install-app hrms --install-app crm
+```
+
+- The site name **must equal the domain**, because nginx picks the site from the Host header.
+- Keep the app order: hrms depends on erpnext.
+- This takes a few minutes. You can ignore the warning that the MariaDB version is not yet tested with Frappe.
+
+Then run:
+
+```
+bench --site erp.tuteome.com enable-scheduler
+```
+
+### 8. First login
+
+- `https://erp.tuteome.com/app`: log in as `Administrator` with the admin password, then complete the ERPNext setup
+  wizard (company, currency, fiscal year, chart of accounts).
+- `https://erp.tuteome.com/crm`: CRM.
+- HR is under `/app` (Employee, Leave, Attendance and Payroll in the sidebar).
+
+Create real user accounts for people. Don't share the Administrator login.
+
+### 9. Backups
+
+The `cron` (ofelia) container runs `bench --site all backup` every 6 hours. The backups are written to
+`sites/erp.tuteome.com/private/backups` inside the `sites` volume, which is on the same server.
+**Copy them off the server.** One way is a Coolify Scheduled Task on `backend` that uploads them to S3 or another remote.
+To include uploaded files in a backup, run `bench --site all backup --with-files`.
+
+### 10. Upgrades
+
+1. Run the build workflow again. It builds the latest `version-16` commits and gives the image a new `version-16-<run>` tag.
+2. Take a backup: `bench --site all backup --with-files`.
+3. Update the image tag in Coolify and redeploy.
+4. In the `backend` terminal, run `bench --site all migrate`.
+
+To move to a new release line (for example `version-17`), check that erpnext, hrms and crm all have that branch first.
+
+---
+
+## Troubleshooting
+
+- **`No module named 'crm'`** (or erpnext/hrms): you're running an image without that app. Check the image tag.
+- **"Site not found"**: either the site name doesn't match the domain, or the site hasn't been created yet.
+- **Access denied for root**: the database was initialised with a different password. MariaDB only reads the
+  root password when it first creates `db-data`. Use the original password, or wipe `db-data` if there's no data yet.
+- **Coolify shows "The key must start with a letter or underscore…"**: a `$$VAR` or `${VAR:-default}`
+  expression got into the compose file. Write the value out literally instead.
