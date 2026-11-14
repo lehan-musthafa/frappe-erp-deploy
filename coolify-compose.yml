@@ -1,0 +1,163 @@
+services:
+  configurator:
+    image: ghcr.io/lehan-musthafa/frappe-erp:version-16
+    platform: linux/amd64
+    pull_policy: missing
+    restart: on-failure
+    exclude_from_hc: true
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        ls -1 apps > sites/apps.txt;
+        bench set-config -g db_host db;
+        bench set-config -gp db_port 3306;
+        bench set-config -g redis_cache "redis://redis-cache:6379";
+        bench set-config -g redis_queue "redis://redis-queue:6379";
+        bench set-config -g redis_socketio "redis://redis-queue:6379";
+        bench set-config -gp socketio_port 9000;
+        bench set-config -g chromium_path /usr/lib/chromium/chromium-headless-shell;
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+    depends_on:
+      db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_started
+      redis-queue:
+        condition: service_started
+
+  backend:
+    image: ghcr.io/lehan-musthafa/frappe-erp:version-16
+    platform: linux/amd64
+    pull_policy: missing
+    restart: unless-stopped
+    environment:
+      GUNICORN_THREADS: "4"
+      GUNICORN_TIMEOUT: "120"
+      GUNICORN_WORKERS: "2"
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+
+  frontend:
+    image: ghcr.io/lehan-musthafa/frappe-erp:version-16
+    platform: linux/amd64
+    pull_policy: missing
+    restart: unless-stopped
+    command: ["nginx-entrypoint.sh"]
+    environment:
+      BACKEND: backend:8000
+      CLIENT_MAX_BODY_SIZE: 50m
+      NGINX_LISTEN_PORT: "8080"
+      PROXY_READ_TIMEOUT: "120"
+      SOCKETIO: websocket:9000
+      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+    depends_on:
+      backend:
+        condition: service_started
+      websocket:
+        condition: service_started
+
+  websocket:
+    image: ghcr.io/lehan-musthafa/frappe-erp:version-16
+    platform: linux/amd64
+    pull_policy: missing
+    restart: unless-stopped
+    command: ["node", "/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+
+  queue-short:
+    image: ghcr.io/lehan-musthafa/frappe-erp:version-16
+    platform: linux/amd64
+    pull_policy: missing
+    restart: unless-stopped
+    command: ["bench", "worker", "--queue", "short,default"]
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+
+  queue-long:
+    image: ghcr.io/lehan-musthafa/frappe-erp:version-16
+    platform: linux/amd64
+    pull_policy: missing
+    restart: unless-stopped
+    command: ["bench", "worker", "--queue", "long,default,short"]
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+
+  scheduler:
+    image: ghcr.io/lehan-musthafa/frappe-erp:version-16
+    platform: linux/amd64
+    pull_policy: missing
+    restart: unless-stopped
+    command: ["bench", "schedule"]
+    labels:
+      ofelia.enabled: "true"
+      ofelia.job-exec.datecron.command: bench --site all backup
+      ofelia.job-exec.datecron.schedule: "@every 6h"
+      ofelia.job-exec.datecron.user: frappe
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+
+  # Runs the 6-hourly `bench --site all backup` defined by the scheduler labels above.
+  cron:
+    image: mcuadros/ofelia:latest
+    command: ["daemon", "--docker"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      scheduler:
+        condition: service_started
+
+  db:
+    image: mariadb:12.3
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --innodb-snapshot-isolation=OFF
+    environment:
+      MARIADB_AUTO_UPGRADE: "1"
+      MYSQL_ROOT_PASSWORD: ${SERVICE_PASSWORD_MARIADB}
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      timeout: 5s
+      interval: 5s
+      retries: 5
+      start_period: 5s
+    volumes:
+      - db-data:/var/lib/mysql
+
+  redis-cache:
+    image: redis:8.10-alpine
+    restart: unless-stopped
+
+  redis-queue:
+    image: redis:8.10-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-queue-data:/data
+
+volumes:
+  sites:
+  db-data:
+  redis-queue-data:

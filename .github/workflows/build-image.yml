@@ -1,0 +1,83 @@
+# Builds one Frappe image with ERPNext (accounting), HRMS and CRM.
+# Self-built because the official ghcr.io/frappe/crm images have shipped
+# without the crm app since v1.67.1 (frappe/crm#2538).
+# Uses frappe_docker's documented layered build with apps.json as a BuildKit secret.
+name: Build Frappe ERP image
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Release line for frappe, erpnext, hrms and crm
+        default: version-16
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout frappe_docker
+        uses: actions/checkout@v4
+        with:
+          repository: frappe/frappe_docker
+          path: builds
+
+      # Order matters: hrms depends on erpnext.
+      - name: Write apps.json
+        run: |
+          cat > apps.json <<EOF
+          [
+            {"url": "https://github.com/frappe/erpnext", "branch": "${{ inputs.branch }}"},
+            {"url": "https://github.com/frappe/hrms", "branch": "${{ inputs.branch }}"},
+            {"url": "https://github.com/frappe/crm", "branch": "${{ inputs.branch }}"}
+          ]
+          EOF
+          cat apps.json
+
+      - name: Image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/frappe-erp" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: builds
+          file: builds/images/layered/Containerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            FRAPPE_PATH=https://github.com/frappe/frappe
+            FRAPPE_BRANCH=${{ inputs.branch }}
+          secret-files: |
+            apps_json=apps.json
+          tags: |
+            ${{ env.IMAGE }}:${{ inputs.branch }}
+            ${{ env.IMAGE }}:${{ inputs.branch }}-${{ github.run_number }}
+
+      # The official images were never tested; this one is.
+      - name: Verify all apps are in the image
+        run: |
+          docker run --rm --entrypoint bash "$IMAGE:${{ inputs.branch }}-${{ github.run_number }}" -c '
+            set -e
+            echo "apps/: $(ls apps | tr "\n" " ")"
+            for app in frappe erpnext hrms crm; do
+              test -d "apps/$app"
+              grep -qx "$app" sites/apps.txt
+              env/bin/python -c "import $app; print(\"$app\", getattr($app, \"__version__\", \"?\"))"
+            done
+          '
+
+      - name: Summary
+        run: |
+          echo "Image: \`$IMAGE:${{ inputs.branch }}-${{ github.run_number }}\`" >> "$GITHUB_STEP_SUMMARY"
